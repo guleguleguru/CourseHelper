@@ -1,0 +1,9 @@
+# 排除课件 PDF（保留示例文档）
+*.pdf
+
+# 但保留示例文档
+!README.md
+!statistics_basics.md
+!research_methods.txt
+
+

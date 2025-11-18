@@ -1,0 +1,31 @@
+# Research TA Agent 配置文件
+
+retriever:
+  backend: "hybrid"          # faiss|chroma|bm25|hybrid
+  top_k: 4
+  hybrid:
+    bm25_weight: 0.35
+    vector_weight: 0.65
+  embedding_model: "text-embedding-3-small"
+  chunk_size: 800
+  chunk_overlap: 120
+
+pandas_runner:
+  allow_plot: true
+  max_rows: 100000
+  sandbox_paths:
+    - "./data"               # 严格限制读写目录
+  fallback_templates: true
+  round_digits: 3
+
+llm:
+  provider: "openai"
+  chat_model: "gpt-4o"
+  temperature: 0.2
+
+output:
+  language: "en"             # zh|en
+  show_sources: true
+
+
+
