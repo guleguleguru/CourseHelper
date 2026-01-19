@@ -1,16 +1,69 @@
 """
-Retriever Tool - 混合检索工具（FAISS + BM25）
+Retriever Tool - Hybrid RAG retriever with reranking support
+
+Two-stage retrieval:
+1. Recall stage: FAISS (vector) + BM25 (keyword) hybrid search
+2. Rerank stage: Cross-encoder reranking for improved precision
 """
 
-from typing import List, Dict, Any
+import hashlib
+import logging
+import time
+from typing import List, Dict, Any, Optional, Tuple
 from langchain_core.tools import Tool
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from src.ingest.indexer import BM25Index
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import reranker
+try:
+    from src.tools.reranker import CrossEncoderReranker, create_reranker
+    RERANKER_AVAILABLE = True
+except ImportError as e:
+    RERANKER_AVAILABLE = False
+    logger.warning(f"Reranker module not available: {e}. Reranking disabled.")
+
+
+def _get_stable_doc_key(doc: Document) -> str:
+    """
+    Generate a stable document key for deduplication.
+    
+    Uses metadata fields (source_file, page, chunk_id) if available,
+    otherwise falls back to hash of (source_file + page + content_prefix).
+    
+    Args:
+        doc: Document object
+        
+    Returns:
+        Stable string key
+    """
+    metadata = doc.metadata
+    
+    # Try to use chunk_id if available
+    if 'chunk_id' in metadata:
+        return f"{metadata.get('source_file', 'unknown')}:{metadata.get('page', 0)}:{metadata['chunk_id']}"
+    
+    # Use source_file + page
+    source_file = metadata.get('source_file', 'unknown')
+    page = metadata.get('page', 0)
+    
+    # Add content hash for uniqueness (first 120 chars)
+    content_prefix = doc.page_content[:120] if doc.page_content else ""
+    content_hash = hashlib.md5(content_prefix.encode()).hexdigest()[:8]
+    
+    return f"{source_file}:{page}:{content_hash}"
+
 
 class HybridRetriever:
-    """混合检索器（向量检索 + 关键词检索）"""
+    """
+    Hybrid retriever with two-stage retrieval:
+    1. Recall: FAISS (vector) + BM25 (keyword) hybrid search
+    2. Rerank: Cross-encoder reranking (optional)
+    """
     
     def __init__(
         self,
@@ -18,102 +71,171 @@ class HybridRetriever:
         bm25_index: BM25Index,
         vector_weight: float = 0.65,
         bm25_weight: float = 0.35,
-        top_k: int = 4
+        top_k: int = 4,
+        reranker: Optional[CrossEncoderReranker] = None,
+        top_n_candidates: Optional[int] = None
     ):
         """
-        初始化混合检索器
+        Initialize hybrid retriever.
         
         Args:
-            vectorstore: FAISS 向量存储
-            bm25_index: BM25 索引
-            vector_weight: 向量检索权重
-            bm25_weight: BM25 检索权重
-            top_k: 返回前 k 个结果
+            vectorstore: FAISS vector store
+            bm25_index: BM25 keyword index
+            vector_weight: Weight for vector search scores
+            bm25_weight: Weight for BM25 scores
+            top_k: Final number of documents to return
+            reranker: Optional reranker instance
+            top_n_candidates: Number of candidates for reranking (default: top_k * 8)
         """
         self.vectorstore = vectorstore
         self.bm25_index = bm25_index
         self.vector_weight = vector_weight
         self.bm25_weight = bm25_weight
         self.top_k = top_k
+        self.reranker = reranker
+        self.top_n_candidates = top_n_candidates or (top_k * 8)
+        
+        # Timing statistics
+        self.last_recall_time = 0.0
+        self.last_rerank_time = 0.0
     
-    def search(self, query: str) -> List[Document]:
+    def search(
+        self,
+        query: str,
+        return_timing: bool = False
+    ) -> List[Document] | Tuple[List[Document], Dict[str, float]]:
         """
-        执行混合检索
+        Execute two-stage hybrid retrieval with optional reranking.
+        
+        Stage 1 (Recall): Hybrid search (FAISS + BM25) with fusion
+        Stage 2 (Rerank): Cross-encoder reranking on top candidates
         
         Args:
-            query: 查询文本
+            query: Query text
+            return_timing: If True, return timing information
             
         Returns:
-            相关文档列表
+            List of top-k documents, optionally with timing dict
         """
-        # 1. 向量检索
+        recall_start = time.time()
+        
+        # Stage 1: Recall - Hybrid search
+        # Get more candidates than final top_k for reranking
+        recall_k = max(self.top_n_candidates, self.top_k * 4)
+        
+        # 1. Vector search (FAISS)
         vector_results = self.vectorstore.similarity_search_with_score(
-            query, 
-            k=self.top_k * 2  # 获取更多候选
+            query,
+            k=recall_k
         )
         
-        # 2. BM25 检索
-        bm25_results = self.bm25_index.search(query, top_k=self.top_k * 2)
+        # 2. BM25 keyword search
+        bm25_results = self.bm25_index.search(query, top_k=recall_k)
         
-        # 3. 融合分数（归一化 + 加权）
-        doc_scores: Dict[str, tuple] = {}  # {doc_id: (Document, score)}
+        # 3. Fusion: Normalize and combine scores
+        doc_scores: Dict[str, Tuple[Document, float]] = {}
         
-        # 归一化向量检索分数
+        # Normalize vector scores
         if vector_results:
             max_vector_score = max(score for _, score in vector_results)
             min_vector_score = min(score for _, score in vector_results)
             vector_range = max_vector_score - min_vector_score
             
             for doc, score in vector_results:
-                # FAISS 距离越小越好，需要反转
+                # FAISS distance: lower is better, invert for normalization
                 normalized_score = 1 - (score - min_vector_score) / (vector_range + 1e-10)
-                doc_id = id(doc)
+                doc_key = _get_stable_doc_key(doc)
                 
-                if doc_id not in doc_scores:
-                    doc_scores[doc_id] = (doc, 0.0)
+                if doc_key not in doc_scores:
+                    doc_scores[doc_key] = (doc, 0.0)
                 
-                current_doc, current_score = doc_scores[doc_id]
-                doc_scores[doc_id] = (
-                    doc, 
+                current_doc, current_score = doc_scores[doc_key]
+                doc_scores[doc_key] = (
+                    current_doc,
                     current_score + normalized_score * self.vector_weight
                 )
         
-        # 归一化 BM25 分数
+        # Normalize BM25 scores
         if bm25_results:
-            max_bm25_score = max(score for _, score in bm25_results)
+            max_bm25_score = max(score for _, score in bm25_results) if bm25_results else 1.0
             
             for doc, score in bm25_results:
                 normalized_score = score / (max_bm25_score + 1e-10)
-                doc_id = id(doc)
+                doc_key = _get_stable_doc_key(doc)
                 
-                if doc_id not in doc_scores:
-                    doc_scores[doc_id] = (doc, 0.0)
+                if doc_key not in doc_scores:
+                    doc_scores[doc_key] = (doc, 0.0)
                 
-                current_doc, current_score = doc_scores[doc_id]
-                doc_scores[doc_id] = (
-                    doc,
+                current_doc, current_score = doc_scores[doc_key]
+                doc_scores[doc_key] = (
+                    current_doc,
                     current_score + normalized_score * self.bm25_weight
                 )
         
-        # 4. 按融合分数排序
-        sorted_docs = sorted(
+        # Sort by fused score
+        sorted_candidates = sorted(
             doc_scores.values(),
             key=lambda x: x[1],
             reverse=True
         )
         
-        # 返回前 top_k 个文档
-        return [doc for doc, _ in sorted_docs[:self.top_k]]
+        recall_time = time.time() - recall_start
+        self.last_recall_time = recall_time
+        
+        # Extract documents from candidates
+        candidate_docs = [doc for doc, _ in sorted_candidates]
+        
+        # Stage 2: Reranking (if enabled)
+        rerank_start = time.time()
+        
+        if self.reranker is not None and len(candidate_docs) > self.top_k:
+            # Take top_n_candidates for reranking
+            rerank_candidates = candidate_docs[:self.top_n_candidates]
+            
+            try:
+                # Rerank and get top_k
+                reranked_docs = self.reranker.rerank(
+                    query=query,
+                    documents=rerank_candidates,
+                    top_k=self.top_k
+                )
+                rerank_time = time.time() - rerank_start
+                self.last_rerank_time = rerank_time
+                
+                logger.info(
+                    f"Reranking: {len(rerank_candidates)} candidates -> {len(reranked_docs)} results "
+                    f"(recall: {recall_time:.3f}s, rerank: {rerank_time:.3f}s)"
+                )
+                
+                final_docs = reranked_docs
+            except Exception as e:
+                logger.warning(f"Reranking failed: {e}. Falling back to fused ranking.")
+                final_docs = candidate_docs[:self.top_k]
+                self.last_rerank_time = 0.0
+        else:
+            # No reranking: return top_k from fused results
+            final_docs = candidate_docs[:self.top_k]
+            self.last_rerank_time = 0.0
+        
+        if return_timing:
+            timing = {
+                'recall_time': self.last_recall_time,
+                'rerank_time': self.last_rerank_time,
+                'total_time': self.last_recall_time + self.last_rerank_time
+            }
+            return final_docs, timing
+        
+        return final_docs
     
     def format_results(self, documents: List[Document]) -> str:
         """
-        格式化检索结果
+        Format retrieval results.
         
         Args:
-            documents: 文档列表
+            documents: List of documents
             
         Returns:
-            格式化的字符串
+            Formatted string
         """
         if not documents:
             return "未找到相关内容。"
@@ -140,36 +262,52 @@ def create_retriever_tool(
     config: Dict[str, Any]
 ) -> Tool:
     """
-    创建检索工具
+    Create retriever tool with optional reranking.
     
     Args:
-        vectorstore: FAISS 向量存储
-        bm25_index: BM25 索引
-        config: 配置字典
+        vectorstore: FAISS vector store
+        bm25_index: BM25 keyword index
+        config: Configuration dictionary
         
     Returns:
-        LangChain Tool 对象
+        LangChain Tool object
     """
     retriever_config = config.get('retriever', {})
     hybrid_config = retriever_config.get('hybrid', {})
+    rerank_config = retriever_config.get('rerank', {})
     
+    # Create reranker if enabled
+    reranker = None
+    if RERANKER_AVAILABLE and rerank_config.get('enabled', False):
+        try:
+            reranker = create_reranker(rerank_config)
+            if reranker:
+                logger.info("Reranker enabled and loaded successfully")
+            else:
+                logger.info("Reranker disabled (model load failed)")
+        except Exception as e:
+            logger.warning(f"Failed to initialize reranker: {e}. Continuing without reranking.")
+    
+    # Create hybrid retriever
     retriever = HybridRetriever(
         vectorstore=vectorstore,
         bm25_index=bm25_index,
         vector_weight=hybrid_config.get('vector_weight', 0.65),
         bm25_weight=hybrid_config.get('bm25_weight', 0.35),
-        top_k=retriever_config.get('top_k', 4)
+        top_k=retriever_config.get('top_k', 4),
+        reranker=reranker,
+        top_n_candidates=rerank_config.get('top_n_candidates', None)
     )
     
     def retriever_func(query: str) -> str:
         """
-        检索函数
+        Retriever function.
         
         Args:
-            query: 查询文本
+            query: Query text
             
         Returns:
-            检索结果
+            Formatted retrieval results
         """
         documents = retriever.search(query)
         return retriever.format_results(documents)
@@ -183,4 +321,3 @@ def create_retriever_tool(
         ),
         func=retriever_func
     )
-

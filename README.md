@@ -16,16 +16,20 @@ A lightweight, local-first AI assistant that can:
 
 | Category | Description |
 |----------|-------------|
-| Retrieval | Hybrid FAISS + BM25 search, citations with file+page |
-| Data Analysis | LLM-generated pandas code with sandboxed execution |
-| Interfaces | Streamlit (`streamlit run app.py`) and CLI (`python main.py`) |
-| Math Output | All formulas rendered with LaTeX |
+| **Agent Framework** | LangGraph-based agent with automatic state management |
+| **Retrieval** | Two-stage RAG: Hybrid FAISS + BM25 search → Cross-encoder reranking |
+| **Data Analysis** | LLM-generated pandas code with sandboxed execution |
+| **Interfaces** | Streamlit (`streamlit run app.py`) and CLI (`python main.py`) |
+| **Math Output** | All formulas rendered with LaTeX |
 
 ## 2. Quick Start
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+
+# Optional: Install reranking dependencies (for improved retrieval precision)
+pip install sentence-transformers transformers torch
 
 # Configure API key
 cp config/.env.example config/.env
@@ -41,6 +45,13 @@ python build_index.py
 # Start web UI
 streamlit run app.py
 ```
+
+### Architecture Highlights
+
+- **LangGraph Agent**: Clean, declarative workflow with automatic state management
+- **Two-Stage RAG**: 
+  - Stage 1 (Recall): Hybrid vector + keyword search retrieves candidate passages
+  - Stage 2 (Rerank): Cross-encoder reranker improves precision of top-k results
 
 ## 3. CLI Usage
 
@@ -80,7 +91,35 @@ python main.py
     └── utils.py
 ```
 
-## 5. Important Notes
+## 5. Advanced Features
+
+### Two-Stage RAG Retrieval
+
+The retriever uses a two-stage approach for improved precision:
+
+1. **Recall Stage**: Hybrid search (FAISS vector + BM25 keyword) retrieves a larger candidate pool
+2. **Rerank Stage**: Cross-encoder reranker (e.g., `BAAI/bge-reranker-base`) scores and reorders candidates
+
+Configure in `config/settings.yaml`:
+```yaml
+retriever:
+  rerank:
+    enabled: true
+    model_name: "BAAI/bge-reranker-base"
+    top_n_candidates: 32  # Candidates for reranking (top_k * 8)
+```
+
+### LangGraph Agent
+
+The agent uses LangGraph for clean, maintainable workflow management:
+- Declarative graph definition
+- Automatic state management
+- Built-in error handling
+- Easy to extend with new nodes
+
+See `LANGGRAPH_SUMMARY.md` for details.
+
+## 6. Important Notes
 
 - **PDF files in `knowledge_base/` are excluded** from the repository (see `.gitignore`)
 - Only example documents (`.md`, `.txt`) are included in the repo
@@ -88,5 +127,6 @@ python main.py
 - Run `python check_setup.py` after installation
 - Rebuild indexes whenever you add/edit PDFs: `python build_index.py`
 - Keep your actual `.env` out of version control
+- Reranking is optional but recommended for better precision
 
 Enjoy streamlined research workflows! 🚀

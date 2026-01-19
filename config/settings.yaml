@@ -9,6 +9,13 @@ retriever:
   embedding_model: "text-embedding-3-small"
   chunk_size: 800
   chunk_overlap: 120
+  # Reranking configuration (optional, improves precision)
+  rerank:
+    enabled: false           # Set to true to enable reranking
+    model_name: "BAAI/bge-reranker-base"  # HuggingFace model name
+    top_n_candidates: 32     # Number of candidates for reranking (default: top_k * 8)
+    batch_size: 32           # Batch size for reranking
+    device: "auto"           # "cpu", "cuda", or "auto"
 
 pandas_runner:
   allow_plot: true

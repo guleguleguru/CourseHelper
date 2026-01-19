@@ -1,12 +1,14 @@
 """
-Research TA Agent 主类
+Research TA Agent - LangGraph Implementation
+
+Cleaner, more maintainable agent using LangGraph for state management.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TypedDict, Annotated
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.tools import Tool
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
 
 from src.utils import load_config, load_env, get_openai_api_key
 from src.ingest.indexer import load_indexes
@@ -14,8 +16,13 @@ from src.tools import create_retriever_tool, create_pandas_runner_tool
 from .prompts import SYSTEM_PROMPT
 
 
+class AgentState(TypedDict):
+    """Agent state for LangGraph"""
+    messages: Annotated[List[BaseMessage], "List of messages in the conversation"]
+
+
 class ResearchAgent:
-    """Research TA Agent - 研究助手代理"""
+    """Research TA Agent - LangGraph-based implementation"""
     
     def __init__(
         self,
@@ -23,20 +30,20 @@ class ResearchAgent:
         index_dir: str = "outputs"
     ):
         """
-        初始化 Research Agent
+        Initialize Research Agent with LangGraph.
         
         Args:
-            config_path: 配置文件路径
-            index_dir: 索引目录路径
+            config_path: Configuration file path
+            index_dir: Index directory path
         """
-        # 加载环境变量和配置
+        # Load environment and config
         load_env()
         self.config = load_config()
         
-        # 验证 API Key
+        # Validate API Key
         api_key = get_openai_api_key()
         
-        # 初始化 LLM
+        # Initialize LLM
         llm_config = self.config.get('llm', {})
         self.llm = ChatOpenAI(
             model=llm_config.get('chat_model', 'gpt-4o'),
@@ -44,8 +51,8 @@ class ResearchAgent:
             api_key=api_key
         )
         
-        # 加载索引
-        print("正在加载索引...")
+        # Load indexes
+        print("Loading indexes...")
         retriever_config = self.config.get('retriever', {})
         embedding_model = retriever_config.get('embedding_model', 'text-embedding-3-small')
         
@@ -60,24 +67,19 @@ class ResearchAgent:
             print("Please run build_index.py first!")
             raise
         
-        # 创建工具
+        # Create tools
         self.tools = self._create_tools()
         
-        # 绑定工具到 LLM
-        self.llm_with_tools = self.llm.bind_tools(self.tools)
+        # Build LangGraph
+        self.graph = self._build_graph()
         
-        print("[OK] Research TA Agent initialized\n")
+        print("[OK] Research TA Agent initialized (LangGraph)\n")
     
-    def _create_tools(self) -> List[Tool]:
-        """
-        创建工具列表
-        
-        Returns:
-            工具列表
-        """
+    def _create_tools(self) -> List:
+        """Create tool list"""
         tools = []
         
-        # Retriever 工具
+        # Retriever tool
         retriever_tool = create_retriever_tool(
             vectorstore=self.vectorstore,
             bm25_index=self.bm25_index,
@@ -85,7 +87,7 @@ class ResearchAgent:
         )
         tools.append(retriever_tool)
         
-        # Pandas Runner 工具
+        # Pandas Runner tool
         pandas_tool = create_pandas_runner_tool(
             llm=self.llm,
             config=self.config
@@ -94,82 +96,120 @@ class ResearchAgent:
         
         return tools
     
-    def _execute_tool_calls(self, message: AIMessage) -> List[str]:
-        """执行工具调用"""
-        results = []
-        
-        if hasattr(message, 'tool_calls') and message.tool_calls:
-            for tool_call in message.tool_calls:
-                tool_name = tool_call['name']
-                tool_args = tool_call['args']
-                
-                print(f"  -> Calling {tool_name} with args: {tool_args}")
-                
-                # 查找并执行工具
-                tool_found = False
-                for tool in self.tools:
-                    if tool.name == tool_name:
-                        tool_found = True
-                        try:
-                            # 提取实际参数
-                            if isinstance(tool_args, dict):
-                                # 工具通常期望单个字符串参数
-                                arg_value = tool_args.get('query') or tool_args.get('task') or list(tool_args.values())[0] if tool_args else ""
-                                result = tool.func(arg_value)
-                            else:
-                                result = tool.func(tool_args)
-                            
-                            results.append(f"\n[Tool: {tool_name}]\n{result}")
-                            print(f"  <- Tool executed successfully")
-                        except Exception as e:
-                            error_msg = f"Error: {str(e)}"
-                            results.append(f"\n[Tool Error: {tool_name}]\n{error_msg}")
-                            print(f"  <- Tool error: {error_msg}")
-                        break
-                
-                if not tool_found:
-                    print(f"  <- Tool not found: {tool_name}")
-        
-        return results
-    
-    def run(self, query: str, max_iterations: int = 3) -> str:
+    def _build_graph(self) -> StateGraph:
         """
-        执行查询
+        Build LangGraph workflow.
+        
+        Graph structure:
+        START -> agent (LLM with tools) -> should_continue -> tool_node OR END
+        """
+        # Bind tools to LLM
+        llm_with_tools = self.llm.bind_tools(self.tools)
+        
+        # Create tool node (executes tool calls)
+        tool_node = ToolNode(self.tools)
+        
+        # Define agent node (calls LLM)
+        def agent_node(state: AgentState) -> Dict[str, List[BaseMessage]]:
+            """Agent node: calls LLM with tools"""
+            messages = state["messages"]
+            
+            # Add system message if not present
+            has_system = any(isinstance(m, SystemMessage) for m in messages)
+            if not has_system:
+                messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+            
+            # Call LLM
+            response = llm_with_tools.invoke(messages)
+            
+            return {"messages": [response]}
+        
+        # Define conditional edge function
+        def should_continue(state: AgentState) -> str:
+            """Determine next step: call tools or end"""
+            messages = state["messages"]
+            if not messages:
+                return "end"
+            
+            last_message = messages[-1]
+            
+            # If last message has tool calls, execute tools
+            if isinstance(last_message, AIMessage) and hasattr(last_message, 'tool_calls'):
+                if last_message.tool_calls:
+                    return "tools"
+            # Otherwise, end
+            return "end"
+        
+        # Build graph
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("agent", agent_node)
+        workflow.add_node("tools", tool_node)
+        
+        # Set entry point
+        workflow.set_entry_point("agent")
+        
+        # Add conditional edges
+        workflow.add_conditional_edges(
+            "agent",
+            should_continue,
+            {
+                "tools": "tools",
+                "end": END
+            }
+        )
+        
+        # Add edge from tools back to agent
+        workflow.add_edge("tools", "agent")
+        
+        # Compile graph
+        # Note: MemorySaver is optional, can be None for stateless execution
+        graph = workflow.compile()
+        
+        return graph
+    
+    def run(
+        self,
+        query: str,
+        max_iterations: int = 5,
+        config: Optional[Dict] = None
+    ) -> str:
+        """
+        Execute query using LangGraph.
         
         Args:
-            query: 用户查询
-            max_iterations: 最大迭代次数
+            query: User query
+            max_iterations: Maximum number of iterations
+            config: Optional runtime config
             
         Returns:
-            Agent 响应
+            Agent response
         """
         try:
-            messages = [
-                ("system", SYSTEM_PROMPT),
-                ("human", query)
-            ]
+            # Create initial state
+            initial_state = {
+                "messages": [HumanMessage(content=query)]
+            }
             
-            for iteration in range(max_iterations):
-                # 调用 LLM
-                response = self.llm_with_tools.invoke(messages)
-                
-                # 检查是否需要调用工具
-                if hasattr(response, 'tool_calls') and response.tool_calls:
-                    print(f"\n[Iteration {iteration + 1}] Calling tools...")
-                    
-                    # 执行工具调用
-                    tool_results = self._execute_tool_calls(response)
-                    
-                    # 将工具结果添加到消息中
-                    messages.append(("assistant", response.content or ""))
-                    for result in tool_results:
-                        messages.append(("human", result))
-                else:
-                    # 没有工具调用，返回最终响应
-                    return response.content
+            # Run graph
+            config_dict = config or {"recursion_limit": max_iterations}
             
-            # 达到最大迭代次数
-            return response.content
+            final_state = self.graph.invoke(
+                initial_state,
+                config=config_dict
+            )
+            
+            # Extract final response
+            messages = final_state["messages"]
+            
+            # Find last AI message (should be the final answer)
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and not (hasattr(msg, 'tool_calls') and msg.tool_calls):
+                    return msg.content
+            
+            # Fallback: return last message content
+            return messages[-1].content if messages else "No response generated"
             
         except Exception as e:
             error_msg = f"[ERROR] Execution failed: {str(e)}"
@@ -178,37 +218,51 @@ class ResearchAgent:
             traceback.print_exc()
             return error_msg
     
-    async def arun(self, query: str) -> str:
+    async def arun(
+        self,
+        query: str,
+        max_iterations: int = 5
+    ) -> str:
         """
-        异步执行查询（简化版本）
+        Async execution.
         
         Args:
-            query: 用户查询
+            query: User query
+            max_iterations: Maximum iterations
             
         Returns:
-            Agent 响应
+            Agent response
         """
-        return self.run(query)  # 简化：使用同步版本
+        try:
+            initial_state = {
+                "messages": [HumanMessage(content=query)]
+            }
+            
+            config_dict = {"recursion_limit": max_iterations}
+            
+            final_state = await self.graph.ainvoke(
+                initial_state,
+                config=config_dict
+            )
+            
+            messages = final_state["messages"]
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and not (hasattr(msg, 'tool_calls') and msg.tool_calls):
+                    return msg.content
+            
+            return messages[-1].content if messages else "No response generated"
+            
+        except Exception as e:
+            error_msg = f"[ERROR] Async execution failed: {str(e)}"
+            print(error_msg)
+            return error_msg
     
     def list_tools(self) -> List[str]:
-        """
-        列出可用工具
-        
-        Returns:
-            工具名称列表
-        """
+        """List available tools"""
         return [tool.name for tool in self.tools]
     
     def get_tool_info(self, tool_name: str) -> Optional[Dict[str, str]]:
-        """
-        获取工具信息
-        
-        Args:
-            tool_name: 工具名称
-            
-        Returns:
-            工具信息字典
-        """
+        """Get tool information"""
         for tool in self.tools:
             if tool.name == tool_name:
                 return {
